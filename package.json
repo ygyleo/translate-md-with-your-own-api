@@ -1,0 +1,28 @@
+{
+  "name": "translate-md-with-your-own-api",
+  "version": "1.0.0",
+  "description": "Translate active Obsidian Markdown notes with your own OpenAI-compatible API.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "test": "vitest run",
+    "release:check": "npm run test && npm run build"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "markdown",
+    "translation",
+    "llm"
+  ],
+  "author": "ygyleo",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "esbuild": "^0.25.4",
+    "obsidian": "^1.11.4",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.4"
+  }
+}

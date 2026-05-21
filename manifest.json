@@ -1,0 +1,9 @@
+{
+  "id": "translate-md-with-your-own-api",
+  "name": "Translate MD with Your Own API",
+  "version": "1.0.0",
+  "minAppVersion": "1.11.4",
+  "description": "Translate active Markdown notes with your own LLM API and preview the result in a side pane.",
+  "author": "ygyleo",
+  "isDesktopOnly": false
+}
