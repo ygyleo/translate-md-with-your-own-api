@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  buildChatCompletionsUrl,
+  buildAnthropicMessagesUrl,
+  buildOpenAiChatCompletionsUrl,
   protectInlineMarkdown,
   restoreInlineMarkdown,
   splitMarkdownSegments,
@@ -10,11 +11,23 @@ import {
 
 describe("translation helpers", () => {
   it("builds an OpenAI-compatible chat completions URL", () => {
-    expect(buildChatCompletionsUrl("https://api.example.com/v1")).toBe(
+    expect(buildOpenAiChatCompletionsUrl("https://api.example.com/v1")).toBe(
       "https://api.example.com/v1/chat/completions"
     );
-    expect(buildChatCompletionsUrl("https://api.example.com/v1/chat/completions")).toBe(
+    expect(buildOpenAiChatCompletionsUrl("https://api.example.com/v1/chat/completions")).toBe(
       "https://api.example.com/v1/chat/completions"
+    );
+  });
+
+  it("builds an Anthropic messages URL", () => {
+    expect(buildAnthropicMessagesUrl("https://api.anthropic.com")).toBe(
+      "https://api.anthropic.com/v1/messages"
+    );
+    expect(buildAnthropicMessagesUrl("https://api.example.com/v1")).toBe(
+      "https://api.example.com/v1/messages"
+    );
+    expect(buildAnthropicMessagesUrl("https://api.example.com/v1/messages")).toBe(
+      "https://api.example.com/v1/messages"
     );
   });
 
@@ -80,6 +93,35 @@ describe("translation helpers", () => {
     expect(translated).toContain("const msg = 'Hello';");
     expect(translated).toContain("Use-translated `inlineCode()` and [docs](https://example.com).");
     expect(chunks.length).toBeGreaterThan(0);
+  });
+
+  it("reports progress after each Markdown part", async () => {
+    const markdown = [
+      "---",
+      "title: Hello",
+      "---",
+      "",
+      "First paragraph.",
+      "",
+      "Second paragraph."
+    ].join("\n");
+    const progressMarkdown: string[] = [];
+
+    const translated = await translateMarkdown(markdown, {
+      targetLanguage: "Chinese (Simplified)",
+      maxChunkChars: 20,
+      onProgress: async (progress) => {
+        progressMarkdown.push(progress.markdown);
+        expect(progress.completedParts).toBeLessThanOrEqual(progress.totalParts);
+        expect(progress.completedRequests).toBeLessThanOrEqual(progress.totalRequests);
+      },
+      translateChunk: async (chunk) => chunk.replace(/paragraph/g, "段落")
+    });
+
+    expect(progressMarkdown.length).toBeGreaterThan(1);
+    expect(progressMarkdown.at(-1)).toBe(translated);
+    expect(translated).toContain("First 段落.");
+    expect(translated).toContain("Second 段落.");
   });
 
   it("splits large text without dropping content", () => {
