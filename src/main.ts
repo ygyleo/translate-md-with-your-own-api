@@ -17,6 +17,7 @@ import {
   buildAnthropicMessagesUrl,
   buildOpenAiChatCompletionsUrl,
   translateMarkdown,
+  TranslationOutputPart,
   TranslationProgress
 } from "./translation";
 
@@ -57,6 +58,19 @@ const DEFAULT_SETTINGS: TranslatorSettings = {
   translateOnModify: true
 };
 
+const TARGET_LANGUAGE_OPTIONS = [
+  "简体中文",
+  "繁体中文",
+  "English",
+  "日本語",
+  "한국어",
+  "Français",
+  "Deutsch",
+  "Español",
+  "Português",
+  "Русский"
+];
+
 interface CompletionRequest {
   maxTokens?: number;
   system: string;
@@ -66,10 +80,12 @@ interface CompletionRequest {
 
 interface OpenAiChatCompletionResponse {
   choices?: Array<{
+    finish_reason?: string;
     message?: {
-      content?: string;
+      content?: ApiTextContent;
+      reasoning_content?: string;
     };
-    text?: string;
+    text?: ApiTextContent;
   }>;
   error?: {
     message?: string;
@@ -77,7 +93,7 @@ interface OpenAiChatCompletionResponse {
 }
 
 interface AnthropicMessagesResponse {
-  content?: Array<{
+  content?: ApiTextContent | Array<{
     text?: string;
     type?: string;
   }>;
@@ -87,11 +103,14 @@ interface AnthropicMessagesResponse {
   };
 }
 
+type ApiTextContent = string | Array<{ content?: string; text?: string; type?: string }>;
+
 export default class LlmMarkdownTranslatorPlugin extends Plugin {
   settings: TranslatorSettings = { ...DEFAULT_SETTINGS };
   private activeRunId = 0;
   private lastFingerprint = "";
   private translateTimer: number | null = null;
+  private userHiddenTranslator = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -112,6 +131,14 @@ export default class LlmMarkdownTranslatorPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "toggle-translator-pane",
+      name: "显示或隐藏翻译侧边栏",
+      callback: () => {
+        this.toggleTranslatorPane();
+      }
+    });
+
+    this.addCommand({
       id: "translate-active-note",
       name: "翻译当前 Markdown",
       callback: () => {
@@ -119,8 +146,8 @@ export default class LlmMarkdownTranslatorPlugin extends Plugin {
       }
     });
 
-    this.addRibbonIcon("languages", "翻译当前 Markdown", () => {
-      this.translateActiveFile(true);
+    this.addRibbonIcon("languages", "显示或隐藏翻译侧边栏", () => {
+      this.toggleTranslatorPane();
     });
 
     this.app.workspace.onLayoutReady(() => {
@@ -186,6 +213,7 @@ export default class LlmMarkdownTranslatorPlugin extends Plugin {
   }
 
   async activateView(): Promise<TranslationView | null> {
+    this.userHiddenTranslator = false;
     let leaf: WorkspaceLeaf | null = this.app.workspace.getLeavesOfType(VIEW_TYPE_TRANSLATOR)[0] ?? null;
     if (!leaf) {
       leaf = this.app.workspace.getRightLeaf(false);
@@ -202,6 +230,30 @@ export default class LlmMarkdownTranslatorPlugin extends Plugin {
     });
     this.app.workspace.revealLeaf(leaf);
     return leaf.view instanceof TranslationView ? leaf.view : null;
+  }
+
+  async toggleTranslatorPane(): Promise<void> {
+    if (this.app.workspace.getLeavesOfType(VIEW_TYPE_TRANSLATOR).length > 0) {
+      this.hideTranslatorPane();
+      return;
+    }
+
+    this.userHiddenTranslator = false;
+    const file = this.app.workspace.getActiveFile();
+    if (file instanceof TFile && file.extension.toLowerCase() === "md") {
+      await this.translateActiveFile(true);
+      return;
+    }
+
+    await this.activateView();
+  }
+
+  hideTranslatorPane(): void {
+    this.userHiddenTranslator = true;
+    this.activeRunId += 1;
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_TRANSLATOR)) {
+      leaf.detach();
+    }
   }
 
   queueTranslateActiveFile(force: boolean): void {
@@ -226,6 +278,13 @@ export default class LlmMarkdownTranslatorPlugin extends Plugin {
 
     const sourceMarkdown = await this.app.vault.cachedRead(file);
     const fingerprint = this.getFingerprint(file, sourceMarkdown);
+    if (
+      !force &&
+      this.userHiddenTranslator &&
+      this.app.workspace.getLeavesOfType(VIEW_TYPE_TRANSLATOR).length === 0
+    ) {
+      return;
+    }
     if (!force && fingerprint === this.lastFingerprint) {
       return;
     }
@@ -272,7 +331,7 @@ export default class LlmMarkdownTranslatorPlugin extends Plugin {
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
-      view.showStatus(`翻译失败：${message}`, file);
+      view.showError(message, file);
       new Notice(`翻译失败：${message}`);
     }
   }
@@ -308,6 +367,7 @@ export default class LlmMarkdownTranslatorPlugin extends Plugin {
           "You are a careful Markdown translator.",
           "Translate only human-readable prose into the target language.",
           "Keep Markdown syntax, heading levels, lists, tables, blockquotes, placeholders, HTML tags, file paths, URLs, commands, identifiers, math, and code exactly unchanged.",
+          "If custom <translate-md-block id=\"...\"> wrapper tags appear, keep those opening and closing tags exactly unchanged and translate only the text inside each wrapper.",
           "Do not wrap the answer in a code block.",
           "Return only the translated Markdown."
         ].join(" "),
@@ -321,10 +381,27 @@ export default class LlmMarkdownTranslatorPlugin extends Plugin {
   }
 
   private async requestCompletion(request: CompletionRequest, apiKey: string): Promise<string> {
-    if (this.settings.provider === "anthropic") {
-      return this.requestAnthropicMessage(request, apiKey);
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const content = this.settings.provider === "anthropic"
+          ? await this.requestAnthropicMessage(request, apiKey)
+          : await this.requestOpenAiChatCompletion(request, apiKey);
+        if (content.trim()) {
+          return content;
+        }
+        throw new EmptyApiContentError();
+      } catch (error) {
+        lastError = error;
+        if (error instanceof EmptyApiContentError && attempt < 2) {
+          await sleep(500 * (attempt + 1));
+          continue;
+        }
+        throw error;
+      }
     }
-    return this.requestOpenAiChatCompletion(request, apiKey);
+
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
   private async requestOpenAiChatCompletion(
@@ -365,9 +442,11 @@ export default class LlmMarkdownTranslatorPlugin extends Plugin {
       throw new Error(json.error.message);
     }
 
-    const content = json.choices?.[0]?.message?.content ?? json.choices?.[0]?.text;
-    if (!content) {
-      throw new Error("API 响应里没有可用内容。");
+    const choice = json.choices?.[0];
+    const content = normalizeApiTextContent(choice?.message?.content) ||
+      normalizeApiTextContent(choice?.text);
+    if (!content.trim()) {
+      throw new EmptyApiContentError(choice?.finish_reason);
     }
 
     return content;
@@ -409,13 +488,10 @@ export default class LlmMarkdownTranslatorPlugin extends Plugin {
       throw new Error(json.error.message);
     }
 
-    const content = json.content
-      ?.filter((block) => block.type === "text" || block.text)
-      .map((block) => block.text ?? "")
-      .join("");
+    const content = normalizeApiTextContent(json.content);
 
-    if (!content) {
-      throw new Error("API 响应里没有可用内容。");
+    if (!content.trim()) {
+      throw new EmptyApiContentError();
     }
 
     return content;
@@ -466,6 +542,25 @@ export default class LlmMarkdownTranslatorPlugin extends Plugin {
     scrollTarget.scrollTop = maxScrollTop * clampedRatio;
   }
 
+  syncSourceToLine(file: TFile | null, line: number): void {
+    if (!file || !Number.isFinite(line)) {
+      return;
+    }
+
+    const markdownView = this.findMarkdownView(file);
+    if (!markdownView) {
+      return;
+    }
+
+    const targetLine = Math.max(0, Math.floor(line));
+    if (!scrollRenderedMarkdownToLine(markdownView.contentEl, targetLine)) {
+      markdownView.editor.scrollIntoView({
+        from: { line: targetLine, ch: 0 },
+        to: { line: targetLine, ch: 0 }
+      });
+    }
+  }
+
   private findMarkdownView(file: TFile): MarkdownView | null {
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       if (leaf.view instanceof MarkdownView && leaf.view.file?.path === file.path) {
@@ -477,13 +572,15 @@ export default class LlmMarkdownTranslatorPlugin extends Plugin {
 }
 
 class TranslationView extends ItemView {
+  private closeButtonEl: HTMLButtonElement | null = null;
   private copyButtonEl: HTMLButtonElement | null = null;
   private currentSourceFile: TFile | null = null;
-  private languageInputEl: HTMLInputElement | null = null;
+  private languageInputEl: HTMLSelectElement | null = null;
   private previewEl: HTMLElement | null = null;
   private statusEl: HTMLElement | null = null;
   private titleEl: HTMLElement | null = null;
   private translatedMarkdown = "";
+  private translatedParts: TranslationOutputPart[] = [];
 
   constructor(leaf: WorkspaceLeaf, private readonly plugin: LlmMarkdownTranslatorPlugin) {
     super(leaf);
@@ -510,26 +607,24 @@ class TranslationView extends ItemView {
     this.ensureBuilt();
     this.currentSourceFile = file;
     this.translatedMarkdown = "";
+    this.translatedParts = [];
     this.copyButtonEl?.setAttr("disabled", "true");
     this.titleEl?.setText(file.path);
-    this.statusEl?.setText(`正在翻译为${this.plugin.settings.targetLanguage}...`);
+    this.statusEl?.setText("正在翻译中 · 0%");
     this.previewEl?.empty();
-    this.previewEl?.createDiv({
-      cls: "translate-md-api-empty",
-      text: "正在翻译。"
-    });
   }
 
   async showPartialMarkdown(file: TFile, progress: TranslationProgress): Promise<void> {
     this.ensureBuilt();
     this.currentSourceFile = file;
     this.translatedMarkdown = progress.markdown;
+    this.translatedParts = progress.parts;
     if (progress.markdown) {
       this.copyButtonEl?.removeAttribute("disabled");
     }
     this.titleEl?.setText(file.path);
     this.statusEl?.setText(this.getProgressText(progress));
-    await this.renderMarkdown(file, progress.markdown);
+    await this.renderMarkdownParts(file, progress.parts);
   }
 
   showStatus(message: string, file?: TFile): void {
@@ -548,14 +643,34 @@ class TranslationView extends ItemView {
     });
   }
 
+  showError(message: string, file?: TFile): void {
+    this.ensureBuilt();
+    if (file) {
+      this.currentSourceFile = file;
+      this.titleEl?.setText(file.path);
+    }
+    this.statusEl?.setText(`翻译失败：${message}`);
+    if (!this.translatedMarkdown) {
+      this.previewEl?.empty();
+      this.previewEl?.createDiv({
+        cls: "translate-md-api-empty",
+        text: message
+      });
+    }
+  }
+
   async showMarkdown(file: TFile, markdown: string): Promise<void> {
     this.ensureBuilt();
     this.currentSourceFile = file;
     this.translatedMarkdown = markdown;
     this.copyButtonEl?.removeAttribute("disabled");
     this.titleEl?.setText(file.path);
-    this.statusEl?.setText(`已翻译为${this.plugin.settings.targetLanguage}`);
-    await this.renderMarkdown(file, markdown);
+    this.statusEl?.setText("翻译完成 · 100%");
+    if (this.translatedParts.length > 0) {
+      await this.renderMarkdownParts(file, this.translatedParts);
+    } else {
+      await this.renderMarkdown(file, markdown);
+    }
   }
 
   private async renderMarkdown(file: TFile, markdown: string): Promise<void> {
@@ -573,15 +688,32 @@ class TranslationView extends ItemView {
     );
   }
 
+  private async renderMarkdownParts(file: TFile, parts: TranslationOutputPart[]): Promise<void> {
+    this.previewEl?.empty();
+    if (!this.previewEl) {
+      return;
+    }
+
+    for (const part of parts) {
+      const partEl = this.previewEl.createDiv({ cls: "translate-md-api-part" });
+      partEl.dataset.sourceEndLine = String(part.sourceEndLine);
+      partEl.dataset.sourceStartLine = String(part.sourceStartLine);
+      await MarkdownRenderer.render(
+        this.app,
+        part.markdown,
+        partEl,
+        file.path,
+        this
+      );
+    }
+  }
+
   private getProgressText(progress: TranslationProgress): string {
     if (progress.totalRequests === 0) {
-      return "没有找到需要翻译的正文，已显示保留后的 Markdown。";
+      return "翻译完成 · 100%";
     }
-    return [
-      `正在翻译为${this.plugin.settings.targetLanguage}`,
-      `API 分块 ${progress.completedRequests}/${progress.totalRequests}`,
-      `Markdown 片段 ${progress.completedParts}/${progress.totalParts}`
-    ].join(" · ");
+    const percent = Math.round((progress.completedParts / Math.max(1, progress.totalParts)) * 100);
+    return `正在翻译中 · ${percent}%`;
   }
 
   private build(): void {
@@ -593,12 +725,10 @@ class TranslationView extends ItemView {
 
     const language = toolbar.createDiv({ cls: "translate-md-api-language" });
     language.createEl("span", { text: "目标语言" });
-    this.languageInputEl = language.createEl("input", {
-      type: "text",
-      value: this.plugin.settings.targetLanguage
-    });
+    this.languageInputEl = language.createEl("select");
+    fillLanguageSelect(this.languageInputEl, this.plugin.settings.targetLanguage);
     this.languageInputEl.addEventListener("change", async () => {
-      const value = this.languageInputEl?.value.trim();
+      const value = this.languageInputEl?.value;
       if (!value) {
         return;
       }
@@ -626,6 +756,15 @@ class TranslationView extends ItemView {
     setIcon(this.copyButtonEl, "copy");
     this.copyButtonEl.addEventListener("click", () => {
       this.copyTranslatedMarkdown();
+    });
+
+    this.closeButtonEl = toolbar.createEl("button", {
+      cls: "clickable-icon",
+      attr: { "aria-label": "隐藏翻译侧边栏" }
+    });
+    setIcon(this.closeButtonEl, "x");
+    this.closeButtonEl.addEventListener("click", () => {
+      this.plugin.hideTranslatorPane();
     });
 
     this.statusEl = this.contentEl.createDiv({ cls: "translate-md-api-status" });
@@ -665,6 +804,15 @@ class TranslationView extends ItemView {
   private syncSourceScrollFromPreview(): void {
     if (!this.previewEl) {
       return;
+    }
+
+    const currentPart = findCurrentTranslatedPart(this.previewEl);
+    if (currentPart) {
+      const sourceStartLine = Number(currentPart.dataset.sourceStartLine);
+      if (Number.isFinite(sourceStartLine)) {
+        this.plugin.syncSourceToLine(this.currentSourceFile, sourceStartLine);
+        return;
+      }
     }
 
     const maxScrollTop = this.previewEl.scrollHeight - this.previewEl.clientHeight;
@@ -771,15 +919,17 @@ class TranslatorSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("目标语言")
       .setDesc("自动翻译时使用的目标语言。")
-      .addText((text) =>
-        text
-          .setPlaceholder("简体中文")
+      .addDropdown((dropdown) => {
+        for (const language of getTargetLanguageOptions(this.plugin.settings.targetLanguage)) {
+          dropdown.addOption(language, language);
+        }
+        dropdown
           .setValue(this.plugin.settings.targetLanguage)
           .onChange(async (value) => {
-            this.plugin.settings.targetLanguage = value.trim() || DEFAULT_SETTINGS.targetLanguage;
+            this.plugin.settings.targetLanguage = value || DEFAULT_SETTINGS.targetLanguage;
             await this.plugin.saveSettings();
-          })
-      );
+          });
+      });
 
     new Setting(containerEl)
       .setName("自动翻译当前文件")
@@ -864,6 +1014,17 @@ class TranslationCancelledError extends Error {
   }
 }
 
+class EmptyApiContentError extends Error {
+  constructor(finishReason?: string) {
+    super(
+      finishReason
+        ? `API 空响应，没有可用内容。finish_reason: ${finishReason}`
+        : "API 空响应，没有可用内容。"
+    );
+    this.name = "EmptyApiContentError";
+  }
+}
+
 function hashString(value: string): string {
   let hash = 5381;
   for (let i = 0; i < value.length; i += 1) {
@@ -880,6 +1041,32 @@ function unwrapMarkdownFence(content: string): string {
 
 function estimateTranslationTokens(markdown: string): number {
   return Math.min(8192, Math.max(1024, Math.ceil(markdown.length / 2)));
+}
+
+function normalizeApiTextContent(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (Array.isArray(content)) {
+    return content.map((item) => normalizeApiTextContent(item)).join("");
+  }
+
+  if (content && typeof content === "object") {
+    const record = content as Record<string, unknown>;
+    if (typeof record.text === "string") {
+      return record.text;
+    }
+    if (typeof record.content === "string") {
+      return record.content;
+    }
+  }
+
+  return "";
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 function findBestScrollElement(root: HTMLElement): HTMLElement | null {
@@ -903,4 +1090,77 @@ function findBestScrollElement(root: HTMLElement): HTMLElement | null {
   }
 
   return bestRange > 0 ? best : null;
+}
+
+function findCurrentTranslatedPart(previewEl: HTMLElement): HTMLElement | null {
+  const parts = Array.from(previewEl.querySelectorAll<HTMLElement>(".translate-md-api-part"))
+    .filter((part) => part.offsetHeight > 0);
+  if (parts.length === 0) {
+    return null;
+  }
+
+  const previewRect = previewEl.getBoundingClientRect();
+  const targetTop = previewRect.top + 8;
+  let bestPart = parts[0];
+
+  for (const part of parts) {
+    const rect = part.getBoundingClientRect();
+    if (rect.bottom >= targetTop) {
+      bestPart = part;
+      break;
+    }
+  }
+
+  return bestPart;
+}
+
+function scrollRenderedMarkdownToLine(root: HTMLElement, line: number): boolean {
+  const scrollTarget = findBestScrollElement(root);
+  if (!scrollTarget) {
+    return false;
+  }
+
+  const lineElements = Array.from(root.querySelectorAll<HTMLElement>("[data-line]"));
+  let target: HTMLElement | null = null;
+  let targetLine = -1;
+
+  for (const element of lineElements) {
+    const elementLine = Number(element.dataset.line);
+    if (!Number.isFinite(elementLine)) {
+      continue;
+    }
+    if (elementLine <= line && elementLine >= targetLine) {
+      target = element;
+      targetLine = elementLine;
+    }
+  }
+
+  if (!target) {
+    return false;
+  }
+
+  const targetRect = target.getBoundingClientRect();
+  const scrollRect = scrollTarget.getBoundingClientRect();
+  scrollTarget.scrollTop += targetRect.top - scrollRect.top - 12;
+  return true;
+}
+
+function fillLanguageSelect(selectEl: HTMLSelectElement, currentValue: string): void {
+  while (selectEl.firstChild) {
+    selectEl.removeChild(selectEl.firstChild);
+  }
+
+  for (const language of getTargetLanguageOptions(currentValue)) {
+    const option = selectEl.createEl("option", { text: language });
+    option.value = language;
+  }
+  selectEl.value = currentValue || DEFAULT_SETTINGS.targetLanguage;
+}
+
+function getTargetLanguageOptions(currentValue: string): string[] {
+  const normalizedCurrentValue = currentValue.trim();
+  if (!normalizedCurrentValue || TARGET_LANGUAGE_OPTIONS.includes(normalizedCurrentValue)) {
+    return TARGET_LANGUAGE_OPTIONS;
+  }
+  return [normalizedCurrentValue, ...TARGET_LANGUAGE_OPTIONS];
 }

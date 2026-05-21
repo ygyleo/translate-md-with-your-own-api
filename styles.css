@@ -11,7 +11,7 @@
   border-bottom: 1px solid var(--background-modifier-border);
   display: grid;
   gap: 8px;
-  grid-template-columns: 1fr auto auto auto;
+  grid-template-columns: 1fr auto auto auto auto;
   padding-bottom: 8px;
 }
 
@@ -34,7 +34,7 @@
   font-size: var(--font-ui-smaller);
 }
 
-.translate-md-api-language input {
+.translate-md-api-language select {
   max-width: 180px;
   min-width: 120px;
 }
@@ -50,6 +50,10 @@
   min-height: 0;
   overflow: auto;
   padding-right: 4px;
+}
+
+.translate-md-api-part {
+  scroll-margin-top: 8px;
 }
 
 .translate-md-api-empty {

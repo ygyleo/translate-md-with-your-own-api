@@ -1,6 +1,8 @@
 export interface MarkdownSegment {
   kind: "protected" | "translatable";
   content: string;
+  sourceEndLine: number;
+  sourceStartLine: number;
 }
 
 export interface TranslateMarkdownOptions {
@@ -14,8 +16,16 @@ export interface TranslationProgress {
   completedParts: number;
   completedRequests: number;
   markdown: string;
+  parts: TranslationOutputPart[];
   totalParts: number;
   totalRequests: number;
+}
+
+export interface TranslationOutputPart {
+  id: number;
+  markdown: string;
+  sourceEndLine: number;
+  sourceStartLine: number;
 }
 
 export interface InlineProtectionResult {
@@ -25,12 +35,26 @@ export interface InlineProtectionResult {
 
 interface TranslationPlanPart {
   kind: "passthrough" | "translatable";
+  batchable: boolean;
   content: string;
+  sourceEndLine: number;
+  sourceStartLine: number;
   tokens?: Map<string, string>;
+}
+
+interface TranslationPlanBatch {
+  kind: "passthrough" | "translatable";
+  parts: TranslationPlanPart[];
+}
+
+interface TranslatedBatch {
+  markdownByPart: string[];
+  requestCount: number;
 }
 
 const DEFAULT_MAX_CHUNK_CHARS = 6000;
 const INLINE_KEEP_PREFIX = "__TRANSLATE_MD_KEEP_";
+const WRAPPED_BLOCK_TAG = "translate-md-block";
 
 export function buildOpenAiChatCompletionsUrl(apiBaseUrl: string): string {
   const trimmed = apiBaseUrl.trim().replace(/\/+$/, "");
@@ -63,25 +87,43 @@ export async function translateMarkdown(
 ): Promise<string> {
   const maxChunkChars = Math.max(1000, options.maxChunkChars ?? DEFAULT_MAX_CHUNK_CHARS);
   const parts = createTranslationPlan(markdown, maxChunkChars);
-  const totalRequests = parts.filter((part) => part.kind === "translatable").length;
+  const batches = createTranslationBatches(parts, maxChunkChars);
+  let totalRequests = batches.filter((batch) => batch.kind === "translatable").length;
   const output: string[] = [];
+  const outputParts: TranslationOutputPart[] = [];
   let completedParts = 0;
   let completedRequests = 0;
 
-  for (const part of parts) {
-    if (part.kind === "passthrough") {
-      output.push(part.content);
-    } else {
-      const translatedChunk = await options.translateChunk(part.content, options.targetLanguage);
-      output.push(restoreInlineMarkdown(translatedChunk, part.tokens ?? new Map()));
-      completedRequests += 1;
-    }
+  for (const batch of batches) {
+    const translatedBatch = batch.kind === "translatable"
+      ? await translateBatch(batch.parts, options)
+      : {
+          markdownByPart: batch.parts.map((part) => part.content),
+          requestCount: 0
+        };
 
-    completedParts += 1;
+    if (translatedBatch.requestCount > 1) {
+      totalRequests += translatedBatch.requestCount - 1;
+    }
+    completedRequests += translatedBatch.requestCount;
+
+    for (let index = 0; index < batch.parts.length; index += 1) {
+      const part = batch.parts[index];
+      const translatedMarkdown = translatedBatch.markdownByPart[index] ?? part.content;
+      output.push(translatedMarkdown);
+      outputParts.push({
+        id: outputParts.length,
+        markdown: translatedMarkdown,
+        sourceEndLine: part.sourceEndLine,
+        sourceStartLine: part.sourceStartLine
+      });
+    }
+    completedParts += batch.parts.length;
     await options.onProgress?.({
       completedParts,
       completedRequests,
       markdown: output.join(""),
+      parts: [...outputParts],
       totalParts: parts.length,
       totalRequests
     });
@@ -90,43 +132,191 @@ export async function translateMarkdown(
   return output.join("");
 }
 
+async function translateBatch(
+  parts: TranslationPlanPart[],
+  options: TranslateMarkdownOptions
+): Promise<TranslatedBatch> {
+  const translatableParts = parts.filter((part) => part.kind === "translatable");
+  if (translatableParts.length === 0) {
+    return {
+      markdownByPart: parts.map((part) => part.content),
+      requestCount: 0
+    };
+  }
+
+  const translatedTranslatableBatch = await translateTranslatableParts(
+    translatableParts,
+    options
+  );
+
+  const markdownByPart: string[] = [];
+  let translatableIndex = 0;
+  for (const part of parts) {
+    if (part.kind === "translatable") {
+      markdownByPart.push(
+        translatedTranslatableBatch.markdownByPart[translatableIndex] ?? part.content
+      );
+      translatableIndex += 1;
+    } else {
+      markdownByPart.push(part.content);
+    }
+  }
+
+  return {
+    markdownByPart,
+    requestCount: translatedTranslatableBatch.requestCount
+  };
+}
+
+async function translateTranslatableParts(
+  parts: TranslationPlanPart[],
+  options: TranslateMarkdownOptions
+): Promise<TranslatedBatch> {
+  if (parts.length === 1) {
+    const part = parts[0];
+    const translatedChunk = await options.translateChunk(part.content, options.targetLanguage);
+    return {
+      markdownByPart: [
+        restoreInlineMarkdown(translatedChunk, part.tokens ?? new Map())
+      ],
+      requestCount: 1
+    };
+  }
+
+  try {
+    const translatedChunk = await options.translateChunk(
+      wrapBatchForTranslation(parts),
+      options.targetLanguage
+    );
+    const parsedParts = parseWrappedBatchTranslation(translatedChunk, parts);
+    if (parsedParts) {
+      return {
+        markdownByPart: parsedParts,
+        requestCount: 1
+      };
+    }
+  } catch (error) {
+    if (!isRecoverableBatchError(error)) {
+      throw error;
+    }
+  }
+
+  const midpoint = Math.ceil(parts.length / 2);
+  const leftBatch = await translateTranslatableParts(parts.slice(0, midpoint), options);
+  const rightBatch = await translateTranslatableParts(parts.slice(midpoint), options);
+  return {
+    markdownByPart: [...leftBatch.markdownByPart, ...rightBatch.markdownByPart],
+    requestCount: 1 + leftBatch.requestCount + rightBatch.requestCount
+  };
+}
+
 function createTranslationPlan(markdown: string, maxChunkChars: number): TranslationPlanPart[] {
   const segments = splitMarkdownSegments(markdown);
   const parts: TranslationPlanPart[] = [];
 
   for (const segment of segments) {
     if (segment.kind === "protected" || !hasLetters(segment.content)) {
-      parts.push({ kind: "passthrough", content: segment.content });
+      parts.push({
+        kind: "passthrough",
+        batchable: segment.kind !== "protected",
+        content: segment.content,
+        sourceEndLine: segment.sourceEndLine,
+        sourceStartLine: segment.sourceStartLine
+      });
       continue;
     }
 
+    let chunkStartLine = segment.sourceStartLine;
     for (const chunk of splitTextForTranslation(segment.content, maxChunkChars)) {
+      const chunkEndLine = chunkStartLine + countLineBreaks(chunk);
       if (!hasLetters(chunk)) {
-        parts.push({ kind: "passthrough", content: chunk });
+        parts.push({
+          kind: "passthrough",
+          batchable: true,
+          content: chunk,
+          sourceEndLine: chunkEndLine,
+          sourceStartLine: chunkStartLine
+        });
+        chunkStartLine = chunkEndLine;
         continue;
       }
 
       const protectedChunk = protectInlineMarkdown(chunk);
       parts.push({
         kind: "translatable",
+        batchable: true,
         content: protectedChunk.text,
+        sourceEndLine: chunkEndLine,
+        sourceStartLine: chunkStartLine,
         tokens: protectedChunk.tokens
       });
+      chunkStartLine = chunkEndLine;
     }
   }
 
   return parts;
 }
 
+function createTranslationBatches(
+  parts: TranslationPlanPart[],
+  maxChunkChars: number
+): TranslationPlanBatch[] {
+  const batches: TranslationPlanBatch[] = [];
+  let currentParts: TranslationPlanPart[] = [];
+
+  const flushCurrentParts = () => {
+    if (currentParts.length === 0) {
+      return;
+    }
+    batches.push({
+      kind: currentParts.some((part) => part.kind === "translatable")
+        ? "translatable"
+        : "passthrough",
+      parts: currentParts
+    });
+    currentParts = [];
+  };
+
+  for (const part of parts) {
+    if (!part.batchable) {
+      flushCurrentParts();
+      batches.push({
+        kind: "passthrough",
+        parts: [part]
+      });
+      continue;
+    }
+
+    const nextParts = [...currentParts, part];
+    if (
+      part.kind === "translatable" &&
+      currentParts.some((currentPart) => currentPart.kind === "translatable") &&
+      getBatchRequestLength(nextParts) > maxChunkChars
+    ) {
+      flushCurrentParts();
+    }
+    currentParts.push(part);
+  }
+
+  flushCurrentParts();
+  return batches;
+}
+
 export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
   const lines = splitLinesKeepEndings(markdown);
   const segments: MarkdownSegment[] = [];
   let translatableBuffer: string[] = [];
+  let translatableStartLine = 0;
   let index = 0;
 
   const flushTranslatable = () => {
     if (translatableBuffer.length > 0) {
-      segments.push({ kind: "translatable", content: translatableBuffer.join("") });
+      segments.push({
+        kind: "translatable",
+        content: translatableBuffer.join(""),
+        sourceEndLine: index,
+        sourceStartLine: translatableStartLine
+      });
       translatableBuffer = [];
     }
   };
@@ -135,9 +325,12 @@ export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
     flushTranslatable();
     segments.push({
       kind: "protected",
-      content: lines.slice(index, endExclusive).join("")
+      content: lines.slice(index, endExclusive).join(""),
+      sourceEndLine: endExclusive,
+      sourceStartLine: index
     });
     index = endExclusive;
+    translatableStartLine = index;
   };
 
   while (index < lines.length) {
@@ -173,6 +366,9 @@ export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
       continue;
     }
 
+    if (translatableBuffer.length === 0) {
+      translatableStartLine = index;
+    }
     translatableBuffer.push(line);
     index += 1;
   }
@@ -219,35 +415,88 @@ export function restoreInlineMarkdown(text: string, tokens: Map<string, string>)
 }
 
 export function splitTextForTranslation(text: string, maxChunkChars: number): string[] {
-  if (text.length <= maxChunkChars) {
-    return [text];
+  const chunks: string[] = [];
+  let currentBlock = "";
+
+  const flushCurrentBlock = () => {
+    if (!currentBlock) {
+      return;
+    }
+    chunks.push(...splitOversizedText(currentBlock, maxChunkChars));
+    currentBlock = "";
+  };
+
+  for (const line of splitLinesKeepEndings(text)) {
+    if (isBlankLine(line)) {
+      flushCurrentBlock();
+      chunks.push(line);
+    } else {
+      currentBlock += line;
+    }
   }
 
-  const chunks: string[] = [];
-  let current = "";
+  flushCurrentBlock();
 
-  for (const part of text.split(/(\n{2,})/)) {
-    if (part.length > maxChunkChars) {
-      if (current) {
-        chunks.push(current);
-        current = "";
-      }
-      chunks.push(...splitOversizedText(part, maxChunkChars));
+  return chunks;
+}
+
+function wrapBatchForTranslation(parts: TranslationPlanPart[]): string {
+  return parts
+    .map((part, index) => {
+      const closingPrefix = part.content.endsWith("\n") ? "" : "\n";
+      return `<${WRAPPED_BLOCK_TAG} id="${index}">\n${part.content}${closingPrefix}</${WRAPPED_BLOCK_TAG}>`;
+    })
+    .join("\n");
+}
+
+function parseWrappedBatchTranslation(
+  markdown: string,
+  originalParts: TranslationPlanPart[]
+): string[] | null {
+  const translatedParts = new Array<string>(originalParts.length);
+  const blockPattern = new RegExp(
+    `<${WRAPPED_BLOCK_TAG}\\s+id=["'](\\d+)["']\\s*>([\\s\\S]*?)<\\/${WRAPPED_BLOCK_TAG}>`,
+    "gi"
+  );
+
+  let match: RegExpExecArray | null;
+  while ((match = blockPattern.exec(markdown)) !== null) {
+    const index = Number.parseInt(match[1], 10);
+    if (!Number.isInteger(index) || index < 0 || index >= originalParts.length) {
       continue;
     }
 
-    if (current.length + part.length > maxChunkChars && current) {
-      chunks.push(current);
-      current = "";
+    let translatedMarkdown = match[2].replace(/^\r?\n/, "");
+    if (!originalParts[index].content.endsWith("\n")) {
+      translatedMarkdown = translatedMarkdown.replace(/\r?\n$/, "");
     }
-    current += part;
+    translatedParts[index] = restoreInlineMarkdown(
+      translatedMarkdown,
+      originalParts[index].tokens ?? new Map()
+    );
   }
 
-  if (current) {
-    chunks.push(current);
+  for (let index = 0; index < originalParts.length; index += 1) {
+    if (typeof translatedParts[index] !== "string") {
+      return null;
+    }
+  }
+  return translatedParts;
+}
+
+function getBatchRequestLength(parts: TranslationPlanPart[]): number {
+  const translatableParts = parts.filter((part) => part.kind === "translatable");
+  if (translatableParts.length <= 1) {
+    return translatableParts[0]?.content.length ?? 0;
   }
 
-  return chunks;
+  return wrapBatchForTranslation(translatableParts).length;
+}
+
+function isRecoverableBatchError(error: unknown): boolean {
+  return error instanceof Error &&
+    (error.name === "EmptyApiContentError" ||
+      /空响应|没有可用内容|empty/i.test(error.message));
 }
 
 function splitOversizedText(text: string, maxChunkChars: number): string[] {
@@ -375,6 +624,14 @@ function findHtmlBlockEnd(lines: string[], start: number): number {
 
 function stripLineEnding(line: string): string {
   return line.replace(/\r?\n$/, "");
+}
+
+function isBlankLine(line: string): boolean {
+  return stripLineEnding(line).trim() === "";
+}
+
+function countLineBreaks(text: string): number {
+  return (text.match(/\n/g) ?? []).length;
 }
 
 function splitLinesKeepEndings(text: string): string[] {
