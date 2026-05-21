@@ -61,14 +61,20 @@ const DEFAULT_SETTINGS: TranslatorSettings = {
 const TARGET_LANGUAGE_OPTIONS = [
   "简体中文",
   "繁体中文",
-  "English",
-  "日本語",
-  "한국어",
-  "Français",
-  "Deutsch",
-  "Español",
-  "Português",
-  "Русский"
+  "英语",
+  "日语",
+  "韩语",
+  "法语",
+  "德语",
+  "西班牙语",
+  "葡萄牙语",
+  "俄语",
+  "意大利语",
+  "荷兰语",
+  "越南语",
+  "泰语",
+  "印尼语",
+  "阿拉伯语"
 ];
 
 interface CompletionRequest {
@@ -834,7 +840,7 @@ class TranslatorSettingTab extends PluginSettingTab {
     containerEl.empty();
 
     new Setting(containerEl)
-      .setName("自配 API 翻译 Markdown")
+      .setName("Your Own API Markdown Translator")
       .setHeading();
 
     new Setting(containerEl)

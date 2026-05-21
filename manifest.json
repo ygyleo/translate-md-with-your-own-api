@@ -1,9 +1,9 @@
 {
   "id": "translate-md-with-your-own-api",
-  "name": "自配 API 翻译 Markdown",
-  "version": "1.0.2",
+  "name": "Your Own API Markdown Translator",
+  "version": "1.0.3",
   "minAppVersion": "1.11.4",
-  "description": "使用你自己的 OpenAI 兼容或 Anthropic API 翻译当前 Markdown，并在侧边栏预览结果。",
+  "description": "Translate Markdown with your own OpenAI-compatible or Anthropic API and preview it in a side pane.",
   "author": "ygyleo",
   "isDesktopOnly": false
 }

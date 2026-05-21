@@ -1,6 +1,6 @@
 {
   "name": "translate-md-with-your-own-api",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Translate active Obsidian Markdown notes with your own OpenAI-compatible API.",
   "main": "main.js",
   "scripts": {

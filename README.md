@@ -1,4 +1,4 @@
-# 自配 API 翻译 Markdown
+# Your Own API Markdown Translator
 
 用你自己的大模型 API 翻译 Obsidian 里的 Markdown。
 
@@ -7,7 +7,7 @@
 - 支持 OpenAI 兼容 API 和 Anthropic API
 - 设置模型名称、Base URL 和 API Key
 - 在设置页测试 API 是否可用
-- 默认翻译为简体中文，可切换目标语言
+- 默认翻译为简体中文，可切换到常用外语
 - 在右侧窗口显示译文，可一键显示或隐藏
 - 大文件会分批翻译并显示进度
 - 尽量保留 Markdown 格式、代码块、链接、数学公式和 frontmatter
@@ -39,7 +39,7 @@ API Key 使用 Obsidian SecretStorage 保存。
 
 ---
 
-# Translate Markdown With Your Own API
+# Your Own API Markdown Translator
 
 Translate Markdown in Obsidian with your own LLM API.
 
@@ -48,7 +48,7 @@ Translate Markdown in Obsidian with your own LLM API.
 - Supports OpenAI-compatible APIs and Anthropic APIs
 - Configure model name, Base URL, and API key
 - Test the API in settings
-- Default target language is Simplified Chinese
+- Default target language is Simplified Chinese, with common target languages included
 - Show translation in the right pane, with one-click show/hide
 - Translate large files in batches and show progress
 - Keeps Markdown format, code blocks, links, math, and frontmatter as much as possible
